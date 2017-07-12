@@ -1,0 +1,91 @@
+io: async IO library based on event loop
+
+Description:
+    Async IO library which is based on IO read/write requests, which can
+    be submitted to the IO queue and if file descriptor (socket, pipe,
+    whatever) is ready to perform read/write - completion will be called.
+
+    E.g. reads/writes from socket can be done as following:
+
+        struct io_queue q;
+        struct io_req req;
+        void *poller;
+        int err;
+
+        io_queue_init(&q);
+
+        /* Create event loop poller */
+        err = poller_create(&poller);
+        assert(err == 0);
+
+        /* Bind queue with one side of the socket */
+        err = io_queue_bind(&q, poller, sock);
+        assert(err == 0);
+
+        /* Init read request, in case of completion on_read() will be called */
+        io_req_init(&req, &q, REQ_RD, NULL, on_read);
+        req.buf = (struct io_buf){
+            .iov[0] = {
+                .iov_base = NULL, /* buffer should be allocated */
+                .iov_len  = 10    /* want to read 10 bytes */
+            },
+            .iov_num  = 1,        /* we have only one buffer */
+            .is_vari_len = false  /* read exactly what is told, i.e. 10 bytes */
+        };
+
+        /* Submit request, i.e. put it to the submission list */
+        err = io_queue_submit(&req);
+        assert(err == 0);
+
+        while (1) {
+            struct poller_item *items[16];
+            int i;
+
+            err = poller_wait(poller, items, ARRAY_SIZE(items), INT_MAX);
+            if (err == 0)
+                 continue;
+            else if (err < 0) {
+                 printf("poller_wait() failed, errno=%d\n", -err);
+                 break;
+            }
+
+            /* Handle events */
+            for (i = 0; i < err; i++) {
+                err = poller_do_action(poller, items[i]);
+                if (err)
+                    /* We are done. */
+                    break;
+            }
+        }
+
+        io_req_deinit(&req);
+        io_queue_unbind(&q);
+        poller_destroy(poller);
+
+
+    Exactly using the same pattern all other types of file descriptors can
+    be used.  See io-test.c for details, where signalfd is shown as example.
+
+    The nice thing about this is that any other protocol can be implemented
+    as a stack, e.g. zmtp-test.c accepts ZMTP (ZeroMQ) REQ sockets.
+
+Why?
+    o No threads.
+    o No C++, no Java.
+    o Plain C.
+    o Single point of wait and control.
+    o Event driven.
+
+Howto:
+    $ make
+
+    then
+
+    $ ./io-test
+
+    or
+
+    $ ./zmtp-test
+
+Author:
+    Roman Pen <r.peniaev@gmail.com>
