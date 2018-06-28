@@ -68,6 +68,15 @@ static int create_signalfd(void)
 	return fd;
 }
 
+const char *replies[] = {
+	"1AAAA1",
+	"2BBBBBB2",
+	"3CCCCCCCCC3",
+	"4DDDDDDDDDDD4",
+	"5EEEEEEEEEEEEE5",
+	"6FFFFFFFFFFFFFFF6"
+};
+
 static int on_read(struct io_req *req, int len);
 
 static int on_write(struct io_req *req, int len)
@@ -78,7 +87,7 @@ static int on_write(struct io_req *req, int len)
 	io_req_put(req);
 	if (len < 0)
 		list_add_tail(&peer->list, &peer->ctx->peers_to_free);
-	else if (--peer->sent == 0) {
+	else if (peer->sent == ARRAY_SIZE(replies)) {
 		/* Queue is ready for new requests */
 		req = io_req_create(&peer->q, REQ_RD, peer, on_read);
 		assert(req);
@@ -88,6 +97,29 @@ static int on_write(struct io_req *req, int len)
 		};
 		err = io_queue_submit(req);
 		assert(err == 0);
+	} else {
+		int flags = REQ_WR;
+		int err;
+
+		peer->sent++;
+
+		flags |= peer->sent == ARRAY_SIZE(replies) ? 0 : REQ_MORE;
+		req = io_req_create(&peer->q, flags, peer, on_write);
+		assert(req);
+		req->buf = (struct io_buf){
+			.iov[0] = {
+				.iov_base = (char *)replies[peer->sent-1],
+				.iov_len  = strlen(replies[peer->sent-1])
+			},
+			.iov_num  = 1,
+		};
+		err = io_queue_submit(req);
+		assert(err == 0);
+
+		printf(" #%d chunk is sent\n", peer->sent);
+		/*
+		  sleep(1);
+		*/
 	}
 
 	return len;
@@ -124,40 +156,18 @@ static int on_read(struct io_req *req, int len)
 		return len;
 	}
 
-	/* Mark request with REQ_MORE, another packet will follow */
+	peer->sent = 1;
 	req = io_req_create(&peer->q, REQ_WR | REQ_MORE, peer, on_write);
 	assert(req);
 	req->buf = (struct io_buf){
 		.iov[0] = {
-			.iov_base = "I am ",
-			.iov_len  = strlen("I am ")
+			.iov_base = (char *)replies[0],
+			.iov_len  = strlen(replies[0])
 		},
-		.iov[1] = {
-			.iov_base = "REP number 1\n",
-			.iov_len  = strlen("REP number 1\n")
-		},
-		.iov_num  = 2,
+		.iov_num  = 1,
 	};
 	err = io_queue_submit(req);
 	assert(err == 0);
-
-	req = io_req_create(&peer->q, REQ_WR, peer, on_write);
-	assert(req);
-	req->buf = (struct io_buf){
-		.iov[0] = {
-			.iov_base = "and I am ",
-			.iov_len  = strlen(" and I am ")
-		},
-		.iov[1] = {
-			.iov_base = "REP number 2\n",
-			.iov_len  = strlen("REP number 2\n")
-		},
-		.iov_num  = 2,
-	};
-	err = io_queue_submit(req);
-	assert(err == 0);
-
-	peer->sent = 2;
 
 	return len;
 }
