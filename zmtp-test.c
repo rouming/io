@@ -68,15 +68,29 @@ static int create_signalfd(void)
 	return fd;
 }
 
+static int on_read(struct io_req *req, int len);
+
 static int on_write(struct io_req *req, int len)
 {
 	struct peer *peer = req->data;
+	int err;
 
 	io_req_put(req);
-	if (--peer->sent == 0)
+	if (len < 0)
 		list_add_tail(&peer->list, &peer->ctx->peers_to_free);
+	else if (--peer->sent == 0) {
+		/* Queue is ready for new requests */
+		req = io_req_create(&peer->q, REQ_RD, peer, on_read);
+		assert(req);
+		req->buf = (struct io_buf){
+			.iov_num  = 1,
+			.is_vari_len = true,
+		};
+		err = io_queue_submit(req);
+		assert(err == 0);
+	}
 
-	return 0;
+	return len;
 }
 
 static int on_read(struct io_req *req, int len)
