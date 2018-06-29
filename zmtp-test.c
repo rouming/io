@@ -359,7 +359,7 @@ out:
 int main(void)
 {
 	printf("Way to connect:\n"
-	       "   $ ./zmqcat -t REQ -e tcp://localhost:5555\n"
+	       "   $ echo Hello | ./zmqcat -t REQ -e tcp://localhost:5555\n"
 	       "   (https://github.com/EmielM/zmqcat.git)\n\n"
 	       "Ctrl-C - exit\n");
 	return run_event_loop();
