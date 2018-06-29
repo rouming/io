@@ -52,6 +52,10 @@ struct io_buf {
 	bool   iov_free[16];
 	size_t iov_num;
 	bool   is_vari_len;
+	struct {
+		size_t read_hint;
+	} __proto;               /* Only for private proto usage, e.g. proto
+				  * hints how many exact bytes should be read. */
 };
 
 void buf_free(struct io_buf *buf);
@@ -95,22 +99,10 @@ struct io_proto {
 	 * Protocol callbacks.
 	 *
 	 * queue_fn returns:
-	 *   =0 - success, req parameter can be replaced.
+	 *   =0 - success.
 	 *   <0 - fatal error happened, propagate error up.
-	 *
-	 * dequeue_fn returns:
-	 *  >=0 - for REQ_RD returned size means minimal size to
-	 *        read (zero means read what request requires).
-	 *        for REQ_WR the return value >= 0 is ignored.
-	 *        req param can be replaced.
-	 *   <0 - fatal error happened, propagate error up.
-	 *
-	 * io_fn returns:
-	 *  any - return value is ignored.
 	 */
-	int (*queue_fn)(struct io_proto *p, struct io_req **req);
-	int (*dequeue_fn)(struct io_proto *p, struct io_req **req);
-	int (*io_fn)(struct io_proto *p, struct io_req *req, int len, int hint);
+	int (*queue_fn)(struct io_proto *p, struct io_req *req);
 };
 
 struct io_queue {

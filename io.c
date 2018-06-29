@@ -30,17 +30,6 @@
 #define _4K          4096
 #define POLLER_RESET (void *)~0ull
 
-#define CALL_PROTO(fn, q, ...) ({					\
-	int __rc = 0;							\
-									\
-	if (q->proto && q->proto->fn && !q->in_proto) {			\
-		q->in_proto = true;					\
-		__rc = q->proto->fn(q->proto, ##__VA_ARGS__);		\
-		q->in_proto = false;					\
-	}								\
-	__rc;								\
-})
-
 #define BEG_IT(buf) (struct iovec_iter){ 0 }
 #define END_IT(buf) buf_vari_len(buf) ?					\
 	(struct iovec_iter) {						\
@@ -446,11 +435,12 @@ static int __read(int fd, struct io_req *req, size_t len)
 	return ret;
 }
 
-static int do_read(int fd, struct io_req *req, size_t hint)
+static int do_read(int fd, struct io_req *req)
 {
 	struct io_buf *buf = &req->buf;
-	int sz;
+	int sz, hint;
 
+	hint = buf->__proto.read_hint;
 	assert(req_check(req) == 0);
 	if (buf_it_end(buf, &buf->pos) ||
 	    buf_it_iovbase(buf, &buf->pos) == NULL) {
@@ -662,8 +652,9 @@ static int __io_queue_cancel(struct io_queue *q, int err)
 	return __poller_set(q->poller, &q->item, 0);
 }
 
-static bool can_complete_rd(struct io_buf *buf, size_t sz, size_t hint)
+static bool can_complete_rd(struct io_buf *buf, size_t sz)
 {
+	size_t hint = buf->__proto.read_hint;
 
 	if (hint == 0)
 		/*
@@ -691,7 +682,7 @@ static bool can_complete_rd(struct io_buf *buf, size_t sz, size_t hint)
 static int on_io_read(struct io_queue *q)
  {
 	struct io_req *req;
-	int sz, hint;
+	int sz;
 
 	if (!(q->item.revents & P_IN) && !req_exists_to_read_from_stash(q))
 		/* Both sources (socket and stash) are empty */
@@ -701,14 +692,10 @@ static int on_io_read(struct io_queue *q)
 	assert(req);
 	assert(is_read_req(req));
 
-	hint = CALL_PROTO(dequeue_fn, q, &req);
-	if (hint < 0)
-		return hint;
-	sz = do_read(q->item.fd, req, hint);
-	CALL_PROTO(io_fn, q, req, sz, hint);
+	sz = do_read(q->item.fd, req);
 	if (sz > 0) {
 		buf_advance(&req->buf, &req->buf.pos, sz);
-		if (can_complete_rd(&req->buf, sz, hint)) {
+		if (can_complete_rd(&req->buf, sz)) {
 			sz = buf_pos(&req->buf);
 			sz = complete_req(req, sz);
 		}
@@ -721,7 +708,7 @@ static int on_io_read(struct io_queue *q)
 static int on_io_write(struct io_queue *q)
 {
 	struct io_req *req;
-	int sz, hint;
+	int sz;
 
 	if (!(q->item.revents & P_OUT))
 		return 0;
@@ -730,11 +717,7 @@ static int on_io_write(struct io_queue *q)
 	assert(req);
 	assert(is_write_req(req));
 
-	hint = CALL_PROTO(dequeue_fn, q, &req);
-	if (hint < 0)
-		return hint;
 	sz = do_write(q->item.fd, req);
-	CALL_PROTO(io_fn, q, req, sz, hint);
 	if (sz > 0) {
 		buf_advance(&req->buf, &req->buf.pos, sz);
 		if (buf_it_end(&req->buf, &req->buf.pos)) {
@@ -875,16 +858,14 @@ int io_queue_submit(struct io_req *req)
 	if (rc)
 		return -EINVAL;
 
-	rc = CALL_PROTO(queue_fn, q, &req);
-	if (rc < 0)
-		return rc;
-	if (req == NULL)
-		/* Request was accepted by the proto */
-		return 0;
-
-	/* Assume proto did a good job */
-	assert(req_check(req) == 0);
-
+	if (!q->in_proto && q->proto && q->proto->queue_fn) {
+		/* Forward request to proto if any */
+		q->in_proto = true;
+		rc = q->proto->queue_fn(q->proto, req);
+		q->in_proto = false;
+		if (rc)
+			return rc;
+	}
 	wr = req->flags & REQ_RDWR_MASK;
 	/*
 	 * Firstly add request to the list (either to the head or to the tail)
