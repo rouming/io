@@ -38,6 +38,14 @@ struct iovec_iter {
 	size_t iov_off;
 };
 
+/**
+ * IO buffer descriptor. Consists of <= 16 IO vectors and is used for reading
+ * or writing to a socket.  Buffer in read request can be of a variable length,
+ * i.e. last IO vector in case of @is_vari_len can consists of zero base and
+ * zero length, which will be correctly filled in after each successful read.
+ * Also after each successful read req->io_fn() will be called, so it is up to
+ * request submitter decide when to stop reading.
+ */
 struct io_buf {
 	struct iovec iov[16];
 	struct iovec_iter pos;
