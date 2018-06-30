@@ -508,6 +508,31 @@ static int do_write(int fd, struct io_req *req)
 	return sz;
 }
 
+static int complete_req(struct io_req *req, int len)
+{
+	int off, dir;
+
+	dir = req->flags & REQ_RDWR_MASK;
+	io_req_get(req);
+	list_del_init(&req->list);
+	off = req->io_fn(req, len);
+	if (dir == REQ_RD) {
+		/* Read path */
+		if (off == 0) {
+			/* Return to the request queue, continue filling in */
+			list_add(&req->list, &req->q->queue[dir]);
+		} else {
+			if (off > 0 && off != len) {
+				/* Stash the rest or everything. */
+				off = stash_rest(req, off, len);
+			}
+		}
+	}
+	io_req_put(req);
+
+	return off;
+}
+
 static void __queue_get(struct io_queue *q)
 {
 	assert(q->refs > 0);
@@ -574,12 +599,10 @@ static void __complete_all(struct io_queue *q, int err)
 	struct io_req *req, *tmp;
 
 	list_for_each_entry_safe(req, tmp, &q->queue[REQ_WR], list) {
-		list_del(&req->list);
-		req->io_fn(req, err);
+		(void)complete_req(req, err);
 	}
 	list_for_each_entry_safe(req, tmp, &q->queue[REQ_RD], list) {
-		list_del(&req->list);
-		req->io_fn(req, err);
+		(void)complete_req(req, err);
 	}
 }
 
@@ -619,7 +642,7 @@ static int on_io_read(struct io_queue *q)
 {
 	struct list_head *rq;
 	struct io_req *req;
-	int sz, end, hint;
+	int sz, hint;
 
 	if (!(q->item.revents & P_IN) && !req_exists_to_read_from_stash(q))
 		/* Both sources (socket and stash) are empty */
@@ -637,25 +660,8 @@ static int on_io_read(struct io_queue *q)
 	if (sz > 0) {
 		buf_advance(&req->buf, &req->buf.pos, sz);
 		if (can_complete_rd(&req->buf, sz, hint)) {
-			list_del_init(&req->list);
-			end = buf_pos(&req->buf);
-			/*
-			 * Increase a ref in order to access request
-			 * if something needs to be stashed.
-			 */
-			io_req_get(req);
-			sz = req->io_fn(req, end);
-			if (sz == 0) {
-				assert(list_empty(&req->list));
-				/* Return to the request queue */
-				list_add(&req->list, rq);
-			} else if (sz > 0 && sz != end) {
-				/*
-				 * Stash the rest or everything.
-				 */
-				sz = stash_rest(req, sz, end);
-			}
-			io_req_put(req);
+			sz = buf_pos(&req->buf);
+			sz = complete_req(req, sz);
 		}
 	}
 	q->item.revents &= ~P_IN;
@@ -684,9 +690,8 @@ static int on_io_write(struct io_queue *q)
 	if (sz > 0) {
 		buf_advance(&req->buf, &req->buf.pos, sz);
 		if (buf_it_end(&req->buf, &req->buf.pos)) {
-			list_del(&req->list);
 			sz = buf_pos(&req->buf);
-			sz = req->io_fn(req, sz);
+			sz = complete_req(req, sz);
 		}
 	}
 	q->item.revents &= ~P_OUT;
@@ -898,6 +903,7 @@ void io_req_init(struct io_req *req, struct io_queue *q, int flags,
 static void __io_req_deinit(struct io_req *req)
 {
 	assert(req->refs == 0);
+	assert(list_empty(&req->list));
 	buf_free(&req->buf);
 }
 
