@@ -335,6 +335,16 @@ int buf_memcpy_to(struct io_buf *src, size_t off, void *ptr, size_t len)
 	return buf_it_append(src, &it_s, &dst, &beg_d, len);
 }
 
+static bool is_read_req(struct io_req *req)
+{
+	return (req->flags & REQ_RDWR_MASK) == REQ_RD;
+}
+
+static bool is_write_req(struct io_req *req)
+{
+	return (req->flags & REQ_RDWR_MASK) == REQ_WR;
+}
+
 static bool is_stashed(struct io_queue *q)
 {
 	return !!q->stash.iov_len;
@@ -342,7 +352,10 @@ static bool is_stashed(struct io_queue *q)
 
 static bool req_exists_to_read_from_stash(struct io_queue *q)
 {
-	return is_stashed(q) && !list_empty(&q->queue[REQ_RD]);
+	struct io_req *req;
+
+	req = list_first_entry_or_null(&q->queue, struct io_req, list);
+	return is_stashed(q) && req && is_read_req(req);
 }
 
 static int stash_rest(struct io_req *req, size_t off, size_t end)
@@ -510,6 +523,9 @@ static int do_write(int fd, struct io_req *req)
 
 static int complete_req(struct io_req *req, int len)
 {
+	struct io_queue *q = req->q;
+
+	bool keep_in_queue = false;
 	int off, dir;
 
 	dir = req->flags & REQ_RDWR_MASK;
@@ -520,7 +536,8 @@ static int complete_req(struct io_req *req, int len)
 		/* Read path */
 		if (off == 0) {
 			/* Return to the request queue, continue filling in */
-			list_add(&req->list, &req->q->queue[dir]);
+			list_add(&req->list, &q->queue);
+			keep_in_queue = true;
 		} else {
 			if (off > 0 && off != len) {
 				/* Stash the rest or everything. */
@@ -529,6 +546,10 @@ static int complete_req(struct io_req *req, int len)
 		}
 	}
 	io_req_put(req);
+	if (!keep_in_queue) {
+		assert(q->reqs_num[dir] > 0);
+		q->reqs_num[dir]--;
+	}
 
 	return off;
 }
@@ -569,6 +590,26 @@ static int __poller_set(void *poller, struct poller_item *item, int new_events)
 	return rc;
 }
 
+static int __poller_update(struct io_queue *q)
+{
+	struct io_req *req;
+
+	int wr, ev;
+
+	/*
+	 * Take first request from the queue and update events.
+	 */
+
+	req = list_first_entry_or_null(&q->queue, struct io_req, list);
+	if (req) {
+		wr = req->flags & REQ_RDWR_MASK;
+		ev = wr ? P_OUT : P_IN;
+	} else
+		ev = 0;
+
+	return __poller_set(q->poller, &q->item, ev);
+}
+
 static int prewait_check_stash(void *poller, struct poller_item *item)
 {
 	struct io_queue *q;
@@ -582,6 +623,18 @@ static int prewait_check_stash(void *poller, struct poller_item *item)
 
 static int __poller_set_prewait(void *poller, struct poller_item *item)
 {
+	struct io_queue *q;
+	struct io_req *req;
+
+	/*
+	 * Take first request from the queue and update prewait callback.
+	 */
+
+	q = container_of(item, struct io_queue, item);
+	req = list_first_entry_or_null(&q->queue, struct io_req, list);
+	if (!req || (req->flags & REQ_WR))
+		return 0;
+
 	item->prewait = prewait_check_stash;
 
 	return poller_set_prewait(poller, item);
@@ -598,10 +651,7 @@ static void __complete_all(struct io_queue *q, int err)
 {
 	struct io_req *req, *tmp;
 
-	list_for_each_entry_safe(req, tmp, &q->queue[REQ_WR], list) {
-		(void)complete_req(req, err);
-	}
-	list_for_each_entry_safe(req, tmp, &q->queue[REQ_RD], list) {
+	list_for_each_entry_safe(req, tmp, &q->queue, list) {
 		(void)complete_req(req, err);
 	}
 }
@@ -639,8 +689,7 @@ static bool can_complete_rd(struct io_buf *buf, size_t sz, size_t hint)
 }
 
 static int on_io_read(struct io_queue *q)
-{
-	struct list_head *rq;
+ {
 	struct io_req *req;
 	int sz, hint;
 
@@ -648,9 +697,9 @@ static int on_io_read(struct io_queue *q)
 		/* Both sources (socket and stash) are empty */
 		return 0;
 
-	rq = &q->queue[REQ_RD];
-	req = list_first_entry_or_null(rq, struct io_req, list);
+	req = list_first_entry_or_null(&q->queue, struct io_req, list);
 	assert(req);
+	assert(is_read_req(req));
 
 	hint = CALL_PROTO(dequeue_fn, q, &req);
 	if (hint < 0)
@@ -671,16 +720,15 @@ static int on_io_read(struct io_queue *q)
 
 static int on_io_write(struct io_queue *q)
 {
-	struct list_head *rq;
 	struct io_req *req;
 	int sz, hint;
 
 	if (!(q->item.revents & P_OUT))
 		return 0;
 
-	rq = &q->queue[REQ_WR];
-	req = list_first_entry_or_null(rq, struct io_req, list);
+	req = list_first_entry_or_null(&q->queue, struct io_req, list);
 	assert(req);
+	assert(is_write_req(req));
 
 	hint = CALL_PROTO(dequeue_fn, q, &req);
 	if (hint < 0)
@@ -702,7 +750,7 @@ static int on_io_write(struct io_queue *q)
 static int on_io(void *poller, struct poller_item *item)
 {
 	struct io_queue *q;
-	int rc = 0, ev;
+	int rc = 0;
 
 	q = container_of(item, struct io_queue, item);
 	__queue_get(q);
@@ -722,9 +770,7 @@ static int on_io(void *poller, struct poller_item *item)
 	/* Clear prewait */
 	__poller_clr_prewait(q->poller, &q->item);
 	/* Update poller with new events */
-	ev  = list_empty(&q->queue[REQ_RD]) ? 0 : P_IN;
-	ev |= list_empty(&q->queue[REQ_WR]) ? 0 : P_OUT;
-	__poller_set(q->poller, &q->item, ev);
+	__poller_update(q);
 out:
 	__queue_put(q);
 
@@ -738,16 +784,16 @@ complete_w_error:
 void io_queue_init(struct io_queue *q)
 {
 	memset(q, 0, sizeof(*q));
-	INIT_LIST_HEAD(&q->queue[REQ_RD]);
-	INIT_LIST_HEAD(&q->queue[REQ_WR]);
+	INIT_LIST_HEAD(&q->queue);
 }
 
 void io_queue_deinit(struct io_queue *q)
 {
 	stash_free(q);
 	assert(q->poller == NULL);
-	assert(list_empty(&q->queue[REQ_RD]));
-	assert(list_empty(&q->queue[REQ_WR]));
+	assert(list_empty(&q->queue));
+	assert(q->reqs_num[REQ_RD] == 0);
+	assert(q->reqs_num[REQ_WR] == 0);
 }
 
 int io_queue_bind(struct io_queue *q, void *poller, int fd)
@@ -820,8 +866,8 @@ bool io_queue_stashed(struct io_queue *q)
 
 int io_queue_submit(struct io_req *req)
 {
-	int rc, ev, wr;
 	struct io_queue *q = req->q;
+	int rc, wr;
 
 	if (q->poller == NULL)
 		return -EINVAL;
@@ -840,6 +886,17 @@ int io_queue_submit(struct io_req *req)
 	assert(req_check(req) == 0);
 
 	wr = req->flags & REQ_RDWR_MASK;
+	/*
+	 * Firstly add request to the list (either to the head or to the tail)
+	 * to simplify __poller_update() and _poller_set_prewait() logic, which
+	 * simply picks up first request from the queue and updates poller events
+	 * accordingly.
+	 */
+	if (tail)
+		list_add_tail(&req->list, &q->queue);
+	else
+		list_add(&req->list, &q->queue);
+
 	if (q->refs == 1) {
 		if (!wr && is_stashed(q))
 			/*
@@ -848,18 +905,19 @@ int io_queue_submit(struct io_req *req)
 			 * for an event to be called just before poller wait and
 			 * then return to on_io.
 			 */
-			__poller_set_prewait(q->poller, &q->item);
+			rc = __poller_set_prewait(q->poller, &q->item);
 
-		/* Update events by ourselves */
-		ev  = q->item.events;
-		ev |= wr ? P_OUT : P_IN;
-		rc = __poller_set(q->poller, &q->item, ev);
-		if (rc)
-			return rc;
+		if (rc == 0)
+			rc = __poller_update(q);
 	}
-	list_add_tail(&req->list, &q->queue[wr]);
+	if (rc)
+		/* Rollback in case of error */
+		list_del_init(&req->list);
+	else
+		/* Success, account added request */
+		q->reqs_num[wr]++;
 
-	return 0;
+	return rc;
 }
 
 int io_queue_cancel(struct io_queue *q)

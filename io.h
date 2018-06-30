@@ -116,7 +116,8 @@ struct io_proto {
 struct io_queue {
 	void *poller;
 	struct poller_item item;
-	struct list_head queue[2];
+	struct list_head queue;
+	int reqs_num[2];
 	struct io_proto *proto;
 	struct iovec stash;
 	size_t stash_pos;
