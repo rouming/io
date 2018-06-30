@@ -145,6 +145,6 @@ void io_req_deinit(struct io_req *req);
 struct io_req *io_req_create(struct io_queue *q, int flags, void *data,
 			     int (*io_fn)(struct io_req *req, int len));
 void io_req_get(struct io_req *req);
-int io_req_put(struct io_req *req);
+bool io_req_put(struct io_req *req);
 
 #endif /* IO_H */

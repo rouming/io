@@ -933,7 +933,7 @@ void io_req_get(struct io_req *req)
 	req->refs += 1;
 }
 
-int io_req_put(struct io_req *req)
+bool io_req_put(struct io_req *req)
 {
 	int refs;
 
@@ -944,7 +944,7 @@ int io_req_put(struct io_req *req)
 		free(req);
 	}
 
-	return refs;
+	return !refs;
 }
 
 #ifdef IO_STANDALONE
