@@ -847,7 +847,7 @@ bool io_queue_stashed(struct io_queue *q)
 	return is_stashed(q);
 }
 
-int io_queue_submit(struct io_req *req)
+static int __io_queue_submit(struct io_req *req, bool tail)
 {
 	struct io_queue *q = req->q;
 	int rc, wr;
@@ -858,11 +858,9 @@ int io_queue_submit(struct io_req *req)
 	if (rc)
 		return -EINVAL;
 
-	if (!q->in_proto && q->proto && q->proto->queue_fn) {
+	if (!q->in_proto && q->proto && q->proto->on_submit) {
 		/* Forward request to proto if any */
-		q->in_proto = true;
-		rc = q->proto->queue_fn(q->proto, req);
-		q->in_proto = false;
+		rc = q->proto->on_submit(q->proto, req);
 		if (rc)
 			return rc;
 	}
@@ -901,6 +899,27 @@ int io_queue_submit(struct io_req *req)
 	return rc;
 }
 
+static int __io_queue_submit_from_proto(struct io_req *req, bool tail)
+{
+	struct io_queue *q = req->q;
+	int rc;
+
+	q->in_proto = true;
+	rc = __io_queue_submit(req, tail);
+	q->in_proto = false;
+
+	return rc;
+}
+
+int io_queue_submit(struct io_req *req)
+{
+	/* Hey, proto, use private call */
+	assert(!req->q->in_proto);
+
+	/* Public API submit call, always to tail */
+	return __io_queue_submit(req, true);
+}
+
 int io_queue_cancel(struct io_queue *q)
 {
 	if (q->poller == NULL)
@@ -915,11 +934,13 @@ int io_queue_set_proto(struct io_queue *q, struct io_proto *proto)
 		if (q->proto)
 			return -EINVAL;
 		proto->q = q;
+		proto->submit = __io_queue_submit_from_proto;
 		q->proto = proto;
 	} else {
 		if (q->proto == NULL)
 			return -EINVAL;
 		q->proto->q = NULL;
+		q->proto->submit = NULL;
 		q->proto = NULL;
 	}
 

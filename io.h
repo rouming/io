@@ -96,13 +96,18 @@ struct io_proto {
 	struct io_queue *q;
 
 	/*
+	 * IO API for proto.
+	 */
+	int (*submit)(struct io_req *req, bool tail);
+
+	/*
 	 * Protocol callbacks.
 	 *
-	 * queue_fn returns:
+	 * on_submit returns:
 	 *   =0 - success.
 	 *   <0 - fatal error happened, propagate error up.
 	 */
-	int (*queue_fn)(struct io_proto *p, struct io_req *req);
+	int (*on_submit)(struct io_proto *p, struct io_req *req);
 };
 
 struct io_queue {
