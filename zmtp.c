@@ -46,6 +46,9 @@
 #define ZMTP_V3_REP_HS_S "\x04\x19\x05READY\x0bSocket-Type\0\0\0\x03REP"
 #define ZMTP_V3_REQ_HS_S         "\x05READY\x0bSocket-Type\0\0\0\x03REQ"
 
+#define TO_HEAD false
+#define TO_TAIL true
+
 static uint8_t ZMTP_SIG[10]  = ZMTP_SIG_S;
 static uint8_t ZMTP_DELIM[2] = ZMTP_DELIM_S;
 
@@ -81,9 +84,7 @@ static struct zmtp_greeting_v3 v3_greet = {
 
 enum {
 	ZMTP_UNKNOWN = 0,
-	ZMTP_REP_IN_GREETING,
-	ZMTP_REP_EST_IN_RECV,
-	ZMTP_REP_EST_IN_SEND,
+	ZMTP_REP_CONNECTED,
 	ZMTP_REP_CLOSED,
 
 	ZMTP_F_MORE    = 1,
@@ -94,37 +95,6 @@ enum {
 
 static int zmtp_expect_msg(struct zmtp *zmtp, struct io_req *req,
 			   bool need_payload, bool *more);
-static bool is_zmtp_req(struct io_req *req);
-
-static void __complete_all(struct zmtp *zmtp, int err)
-{
-	struct io_req *req, *tmp;
-
-	list_for_each_entry_safe(req, tmp, &zmtp->orig_reqs, list) {
-		list_del(&req->list);
-		req->io_fn(req, err);
-	}
-}
-
-static int __queue_all(struct zmtp *zmtp, int rdwr)
-{
-	struct io_req *req, *tmp;
-	int rc;
-
-	list_for_each_entry_safe(req, tmp, &zmtp->orig_reqs, list) {
-		if ((req->flags & REQ_RDWR_MASK) != rdwr)
-			continue;
-		list_del(&req->list);
-		rc = io_queue_submit(req);
-		if (rc < 0) {
-			list_add(&req->list, &zmtp->orig_reqs);
-
-			return rc;
-		}
-	}
-
-	return 0;
-}
 
 int zmtp_signature_check(const void *buf, size_t len)
 {
@@ -159,34 +129,47 @@ static int zmtp_parse_hshake(struct io_req *req, int proto)
 	}
 }
 
-
 static int on_recv__REP(struct io_req *req, int len)
 {
 	struct zmtp *zmtp = req->data;
+	struct io_queue *q = zmtp->io_proto.q;
+	struct io_req *rd_req;
+	int exp_len;
 	bool more;
-	int rc;
 
 	if (len < 0)
 		goto out;
 
-	rc = zmtp_expect_msg(zmtp, req, false, &more);
-	if (rc < 0) {
-		rc = len;
+	exp_len = zmtp_expect_msg(zmtp, req, false, &more);
+	if (exp_len < 0) {
+		len = exp_len;
 		goto out;
 	}
-	if (rc == 0)
+	if (exp_len == 0)
 		/* Package is not fully received, continue */
 		return 0;
 
-	zmtp->read_len = rc;
-	zmtp->read_more = more;
+	rd_req = list_first_entry_or_null(&q->queue, struct io_req, list);
+	/* Should be checked by on_proto_submit_REP() */
+	assert(rd_req);
+	assert((rd_req->flags & REQ_RDWR_MASK) == REQ_RD);
+
+	if (!buf_vari_len(&rd_req->buf)) {
+		/* Expect exact size if request is not of a variable length */
+		if (exp_len != (buf_len(&rd_req->buf) - buf_pos(&rd_req->buf))) {
+			len = -EPROTO;
+			goto out;
+		}
+	} else {
+		rd_req->buf.__proto.read_hint = exp_len;
+	}
+	if (more)
+		rd_req->flags |= REQ_MORE;
 
 out:
 	io_req_put(req);
-	if (len < 0) {
+	if (len < 0)
 		zmtp->inner_state = ZMTP_REP_CLOSED;
-		__complete_all(zmtp, len);
-	}
 
 	return len;
 }
@@ -217,13 +200,7 @@ static struct io_req *zmtp_create_rd_hdr_req(struct zmtp *zmtp)
 
 static int on_send__REP(struct io_req *req, int len)
 {
-	struct zmtp *zmtp = req->data;
-
 	io_req_put(req);
-	if (len > 0) {
-		zmtp->sent_num += 1;
-		zmtp->hdr_sent = true;
-	}
 
 	return len;
 }
@@ -231,33 +208,47 @@ static int on_send__REP(struct io_req *req, int len)
 static void zmtp_init_wr_hdr_req(struct zmtp *zmtp, struct io_req *hdr_req,
 				 struct io_req *wr_req)
 {
-	struct iovec *iov;
 	int len = buf_len(&wr_req->buf);
+	struct iovec *iov;
+	uint8_t *hdr_flags;
+	uint64_t *hdr_len;
+	int hdr_len_sz;
 
-	if (!zmtp->sent_num) {
+	if (!zmtp->delim_sent) {
+		zmtp->delim_sent = true;
 		/* Firstly set empty delimiter */
 		hdr_req->buf.iov[0].iov_base = ZMTP_DELIM;
 		hdr_req->buf.iov[0].iov_len  = sizeof(ZMTP_DELIM);
 		hdr_req->buf.iov_num = 1;
 	}
-	iov = &hdr_req->buf.iov[hdr_req->buf.iov_num];
+	if (!(wr_req->flags & REQ_MORE))
+		zmtp->delim_sent = false;
+
+	BUILD_BUG_ON(sizeof(hdr_req->buf.__proto.stash) <
+		     sizeof(*hdr_flags) + sizeof(*hdr_len));
+
+	/* Set size */
+	hdr_len = (typeof(hdr_len))hdr_req->buf.__proto.stash;
+	if (len > 255) {
+		*hdr_len = htobe64((uint64_t)len);
+		hdr_len_sz = 8;
+	} else {
+		*hdr_len = (uint8_t)len;
+		hdr_len_sz = 1;
+	}
+
 	/* Set flags */
-	zmtp->hdr.flags  = wr_req->flags & REQ_MORE ? ZMTP_F_MORE : 0;
-	zmtp->hdr.flags |= len > 255 ? ZMTP_F_LONG : 0;
-	iov->iov_base = &zmtp->hdr.flags;
+	hdr_flags = (typeof(hdr_flags))hdr_len + 1;
+	*hdr_flags  = wr_req->flags & REQ_MORE ? ZMTP_F_MORE : 0;
+	*hdr_flags |= len > 255 ? ZMTP_F_LONG : 0;
+
+	/* Apply pointers to iov */
+	iov = &hdr_req->buf.iov[hdr_req->buf.iov_num];
+	iov->iov_base = hdr_flags;
 	iov->iov_len  = 1;
 	iov += 1;
-	/* Set size */
-	if (len > 255) {
-		zmtp->hdr.len = htobe64(len);
-		iov->iov_len  = 8;
-	} else {
-		zmtp->hdr.len = len;
-		iov->iov_len  = 1;
-
-	}
-	iov->iov_base = &zmtp->hdr.len;
-
+	iov->iov_base = hdr_len;
+	iov->iov_len  = hdr_len_sz;
 	hdr_req->buf.iov_num += 2;
 }
 
@@ -343,37 +334,17 @@ out:
 	return len;
 }
 
-static int zmtp_switch_to_in_recv(struct zmtp *zmtp)
-{
-	zmtp->inner_state = ZMTP_REP_EST_IN_RECV;
-
-	return __queue_all(zmtp, REQ_RD);
-}
-
 static int on_greet_v3_3_hshake_send__REP(struct io_req *req, int len)
 {
 	struct zmtp *zmtp = req->data;
-	int rc;
 
 	/*
-	 * Our hshake is sent, submit all original RD requests.
+	 * Our hshake is sent, ready for incoming data.
 	 */
+	io_req_put(req);
 
 	if (len < 0)
-		goto out;
-
-	rc = zmtp_switch_to_in_recv(zmtp);
-	if (rc < 0) {
-		len = rc;
-		goto out;
-	}
-
-out:
-	io_req_put(req);
-	if (len < 0) {
 		zmtp->inner_state = ZMTP_REP_CLOSED;
-		__complete_all(zmtp, len);
-	}
 
 	return len;
 }
@@ -423,7 +394,7 @@ static int on_greet_v3_3_hshake_recv__REP(struct io_req *req, int len)
 		},
 		.iov_num  = 1,
 	};
-	rc = io_queue_submit(wr_req);
+	rc = zmtp->io_proto.submit(wr_req, TO_HEAD);
 	if (rc) {
 		io_req_put(wr_req);
 		len = rc;
@@ -432,10 +403,8 @@ static int on_greet_v3_3_hshake_recv__REP(struct io_req *req, int len)
 
 out:
 	io_req_put(req);
-	if (len < 0) {
+	if (len < 0)
 		zmtp->inner_state = ZMTP_REP_CLOSED;
-		__complete_all(zmtp, len);
-	}
 
 	return len;
 }
@@ -478,7 +447,7 @@ static int on_greet_v3_2_rest_recv__REP(struct io_req *req, int len)
 		},
 		.iov_num  = 1,
 	};
-	rc = io_queue_submit(rd_req);
+	rc = zmtp->io_proto.submit(rd_req, TO_HEAD);
 	if (rc) {
 		io_req_put(rd_req);
 		len = rc;
@@ -487,10 +456,8 @@ static int on_greet_v3_2_rest_recv__REP(struct io_req *req, int len)
 
 out:
 	io_req_put(req);
-	if (len < 0) {
+	if (len < 0)
 		zmtp->inner_state = ZMTP_REP_CLOSED;
-		__complete_all(zmtp, len);
-	}
 
 	return len;
 }
@@ -519,7 +486,7 @@ static int on_greet_v3_2_rest_send__REP(struct io_req *req, int len)
 		},
 		.iov_num = 1,
 	};
-	rc = io_queue_submit(rd_req);
+	rc = zmtp->io_proto.submit(rd_req, TO_HEAD);
 	if (rc) {
 		io_req_put(rd_req);
 		len = rc;
@@ -528,10 +495,8 @@ static int on_greet_v3_2_rest_send__REP(struct io_req *req, int len)
 
 out:
 	io_req_put(req);
-	if (len < 0) {
+	if (len < 0)
 		zmtp->inner_state = ZMTP_REP_CLOSED;
-		__complete_all(zmtp, len);
-	}
 
 	return len;
 }
@@ -553,7 +518,7 @@ static int zmtp_greet_v3_rest_send(struct zmtp *zmtp)
 		},
 		.iov_num  = 1,
 	};
-	rc = io_queue_submit(wr_req);
+	rc = zmtp->io_proto.submit(wr_req, TO_HEAD);
 	if (rc) {
 		io_req_put(wr_req);
 
@@ -567,7 +532,6 @@ static int on_greet_v2_2_rest_recv__REP(struct io_req *req, int len)
 {
 	struct zmtp *zmtp = req->data;
 	void *greet;
-	int rc;
 
 	/*
 	 * The rest is received, validate version and recv the REQ hshake
@@ -583,17 +547,10 @@ static int on_greet_v2_2_rest_recv__REP(struct io_req *req, int len)
 		len = -EMSGSIZE;
 		goto out;
 	}
-
-	rc = zmtp_switch_to_in_recv(zmtp);
-	if (rc < 0)
-		len = rc;
-
 out:
 	io_req_put(req);
-	if (len < 0) {
+	if (len < 0)
 		zmtp->inner_state = ZMTP_REP_CLOSED;
-		__complete_all(zmtp, len);
-	}
 
 	return len;
 }
@@ -622,7 +579,7 @@ static int on_greet_v2_2_rest_send__REP(struct io_req *req, int len)
 		},
 		.iov_num = 1,
 	};
-	rc = io_queue_submit(rd_req);
+	rc = zmtp->io_proto.submit(rd_req, TO_HEAD);
 	if (rc) {
 		io_req_put(rd_req);
 		len = rc;
@@ -631,10 +588,8 @@ static int on_greet_v2_2_rest_send__REP(struct io_req *req, int len)
 
 out:
 	io_req_put(req);
-	if (len < 0) {
+	if (len < 0)
 		zmtp->inner_state = ZMTP_REP_CLOSED;
-		__complete_all(zmtp, len);
-	}
 
 	return len;
 }
@@ -656,7 +611,7 @@ static int zmtp_greet_v2_rest_send(struct zmtp *zmtp)
 		},
 		.iov_num  = 1,
 	};
-	rc = io_queue_submit(wr_req);
+	rc = zmtp->io_proto.submit(wr_req, TO_HEAD);
 	if (rc) {
 		io_req_put(wr_req);
 
@@ -704,10 +659,8 @@ static int on_greet_1_sign_recv__REP(struct io_req *req, int len)
 
 out:
 	io_req_put(req);
-	if (len < 0) {
+	if (len < 0)
 		zmtp->inner_state = ZMTP_REP_CLOSED;
-		__complete_all(zmtp, len);
-	}
 
 	return len;
 }
@@ -722,7 +675,6 @@ static int on_greet_1_sign_send__REP(struct io_req *req, int len)
 	 * Signature is sent, recv a peer signature
 	 */
 
-	assert(zmtp->inner_state == ZMTP_REP_IN_GREETING);
 	if (len < 0)
 		goto out;
 	rd_req = io_req_create(zmtp->io_proto.q, REQ_RD, zmtp,
@@ -737,7 +689,7 @@ static int on_greet_1_sign_send__REP(struct io_req *req, int len)
 		},
 		.iov_num  = 1,
 	};
-	rc = io_queue_submit(rd_req);
+	rc = zmtp->io_proto.submit(rd_req, TO_HEAD);
 	if (rc) {
 		io_req_put(rd_req);
 		len = rc;
@@ -746,10 +698,8 @@ static int on_greet_1_sign_send__REP(struct io_req *req, int len)
 
 out:
 	io_req_put(req);
-	if (len < 0) {
+	if (len < 0)
 		zmtp->inner_state = ZMTP_REP_CLOSED;
-		__complete_all(zmtp, len);
-	}
 
 	return len;
 }
@@ -775,201 +725,45 @@ static int zmtp_start_greeting_REP(struct zmtp *zmtp)
 		},
 		.iov_num  = 1,
 	};
-	rc = io_queue_submit(wr_req);
+	rc = zmtp->io_proto.submit(wr_req, TO_HEAD);
 	if (rc) {
 		io_req_put(wr_req);
 
 		return rc;
 	}
-	zmtp->inner_state = ZMTP_REP_IN_GREETING;
+	zmtp->inner_state = ZMTP_REP_CONNECTED;
 
 	return 0;
 }
 
-static bool is_zmtp_req(struct io_req *req)
+static int on_proto_submit_REP(struct io_proto *p, struct io_req *req)
 {
-	return (req->io_fn == on_recv__REP ||
-		req->io_fn == on_send__REP ||
-
-		req->io_fn == on_greet_v2_2_rest_recv__REP ||
-		req->io_fn == on_greet_v2_2_rest_send__REP ||
-
-		req->io_fn == on_greet_v3_3_hshake_send__REP ||
-		req->io_fn == on_greet_v3_3_hshake_recv__REP ||
-		req->io_fn == on_greet_v3_2_rest_recv__REP ||
-		req->io_fn == on_greet_v3_2_rest_send__REP ||
-
-		req->io_fn == on_greet_1_sign_recv__REP ||
-		req->io_fn == on_greet_1_sign_send__REP);
-}
-
-static int on_proto_dequeue_REP(struct io_proto *p, struct io_req **req_)
-{
+	struct io_req *hdr_req;
 	struct zmtp *zmtp;
-	struct io_req *req = *req_;
-
-	if (is_zmtp_req(req))
-		return 0;
+	int rc;
 
 	zmtp = container_of(p, struct zmtp, io_proto);
 	if (zmtp->inner_state == ZMTP_REP_CLOSED)
 		/* That's all folks */
-		return -EINVAL;
-
-	if (req->flags & REQ_WR) {
-		assert(zmtp->inner_state == ZMTP_REP_EST_IN_SEND);
-		if (zmtp->hdr_sent) {
-			zmtp->hdr_sent = false;
-
-			return 0;
-		}
-		req = zmtp_create_wr_hdr_req(zmtp, req);
-		if (req == NULL)
-			return -ENOMEM;
-	} else {
-		if (zmtp->inner_state == ZMTP_REP_EST_IN_SEND) {
-			/*
-			 * Read requests can be observed in the queue when
-			 * the state does not suppose reading in two cases:
-			 *
-			 * 1. More reads req were submitted, than peer has sent.
-			 * 2. Read was returned to the queue (0 from io_fn).
-			 */
-			return -EINVAL;
-		}
-		assert(zmtp->inner_state == ZMTP_REP_EST_IN_RECV);
-		if (io_queue_stashed(zmtp->io_proto.q))
-			/* We handle only reads from socket, not from stash */
-			return 0;
-		if (zmtp->read_len)
-			/* Still have something to read */
-			return zmtp->read_len;
-		req = zmtp_create_rd_hdr_req(zmtp);
-		if (req == NULL)
-			return -ENOMEM;
-	}
-	*req_ = req;
-
-	return 0;
-}
-
-static int on_proto_io_REP(struct io_proto *p, struct io_req *req,
-			   int len, int hint)
-{
-	struct zmtp *zmtp = container_of(p, struct zmtp, io_proto);
-	int rc;
-
-	if (len < 0) {
-		/*
-		 * We have to call completion only in certain case and that
-		 * is a bit tricky.  ZMTP request can be orphaned and does
-		 * not belong to any IO queue only when it was just created.
-		 * Only in that particular case we have to call a completion.
-		 * In other cases IO queue takes the onwership.
-		 */
-		if (is_zmtp_req(req) && list_empty(&req->list))
-			/* Do not forget to call completion */
-			req->io_fn(req, len);
-
-		/* Even in case of error return 0 */
-		return 0;
-	}
-	if (is_zmtp_req(req))
-		return 0;
-
-	if (req->flags & REQ_WR) {
-		assert(zmtp->inner_state == ZMTP_REP_EST_IN_SEND);
-		assert(zmtp->read_len == 0);
-		assert(list_empty(&zmtp->orig_reqs));
-		if (!(req->flags & REQ_MORE))
-			/* Last message was sent */
-			zmtp->inner_state = ZMTP_REP_CLOSED;
-	} else {
-		assert(zmtp->inner_state == ZMTP_REP_EST_IN_RECV);
-		assert(zmtp->read_len > 0);
-		assert(zmtp->read_len >= len);
-		if (hint == 0) {
-			/*
-			 * Previous dequeue has returned 0 on read from a
-			 * stash, do not account anything.
-			 */
-			return 0;
-		}
-		zmtp->read_len -= len;
-		if (!zmtp->read_len && zmtp->read_more)
-			req->flags |= REQ_MORE;
-		if (!zmtp->read_len && !zmtp->read_more) {
-			/* Do not expect reads any more, switch on send */
-			zmtp->inner_state = ZMTP_REP_EST_IN_SEND;
-			/*
-			 * If read requests are still queued - they will
-			 * be completed with error on attempt to dequeue.
-			 */
-			rc = __queue_all(zmtp, REQ_RD);
-			if (rc < 0)
-				goto err;
-			rc = __queue_all(zmtp, REQ_WR);
-			if (rc < 0)
-				goto err;
-		}
-	}
-
-	return 0;
-
-err:
-	zmtp->inner_state = ZMTP_REP_CLOSED;
-	__complete_all(zmtp, rc);
-
-	/* Yes, here we ignore errors by all means */
-	return 0;
-}
-
-static int on_proto_queue_REP(struct io_proto *p, struct io_req **req_)
-{
-	struct io_req *req = *req_;
-	struct zmtp *zmtp;
-	int rc;
-
-	if (is_zmtp_req(req))
-		return 0;
-
-	zmtp = container_of(p, struct zmtp, io_proto);
-	switch (zmtp->inner_state) {
-	case ZMTP_UNKNOWN:
-		if (req->flags & REQ_WR)
-			/* This is ZMTP_REP, first request is read request */
-			return -EINVAL;
-		/* Start greeting */
-		rc = zmtp_start_greeting_REP(zmtp);
-		if (rc < 0)
-			return rc;
-		/* Fall thru */
-	case ZMTP_REP_IN_GREETING:
-		/* Accumulate reqs */
-		list_add_tail(&req->list, &zmtp->orig_reqs);
-		*req_ = NULL;
-		return 0;
-	case ZMTP_REP_EST_IN_RECV:
-		if (req->flags & REQ_WR) {
-			list_add_tail(&req->list, &zmtp->orig_reqs);
-			*req_ = NULL;
-			return 0;
-		}
-		/* Will meet in dequeue_fn */
-		return 0;
-	case ZMTP_REP_EST_IN_SEND:
-		if (!(req->flags & REQ_WR))
-			/* This is ZMTP_REP, we expect write request */
-			return -EINVAL;
-		/* Will meet in dequeue_fn */
-		return 0;
-	case ZMTP_REP_CLOSED:
-		/* That's all folks */
 		return -ENOTCONN;
-	default:
-		assert(0);
-		return -EINVAL;
-	}
+
+	if (req->flags & REQ_WR)
+		hdr_req = zmtp_create_wr_hdr_req(zmtp, req);
+	else
+		hdr_req = zmtp_create_rd_hdr_req(zmtp);
+
+	if (hdr_req == NULL)
+		return -ENOMEM;
+
+	rc = zmtp->io_proto.submit(hdr_req, TO_TAIL);
+	if (rc)
+		return rc;
+
+	if (zmtp->inner_state == ZMTP_UNKNOWN)
+		/* Start greeting */
+		return zmtp_start_greeting_REP(zmtp);
+
+	return 0;
 }
 
 static int zmtp_init_REP(struct zmtp *zmtp, struct io_queue *q)
@@ -977,12 +771,9 @@ static int zmtp_init_REP(struct zmtp *zmtp, struct io_queue *q)
 	*zmtp = (struct zmtp){
 		.inner_state = ZMTP_UNKNOWN,
 		.io_proto = {
-			.queue_fn   = on_proto_queue_REP,
-			.dequeue_fn = on_proto_dequeue_REP,
-			.io_fn      = on_proto_io_REP
+			.on_submit = on_proto_submit_REP,
 		},
 	};
-	INIT_LIST_HEAD(&zmtp->orig_reqs);
 
 	return io_queue_set_proto(q, &zmtp->io_proto);
 }

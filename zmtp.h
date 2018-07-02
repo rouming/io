@@ -41,11 +41,7 @@ struct zmtp {
 		uint64_t len;
 	} hdr;
 	int inner_state;
-	size_t read_len;
-	bool read_more;
-	bool hdr_sent;
-	int sent_num;
-	struct list_head orig_reqs;
+	bool delim_sent;
 };
 
 int zmtp_signature_check(const void *buf, size_t len);
