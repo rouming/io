@@ -54,6 +54,7 @@ struct io_buf {
 	bool   is_vari_len;
 	struct {
 		size_t read_hint;
+		char   stash[16];
 	} __proto;               /* Only for private proto usage, e.g. proto
 				  * hints how many exact bytes should be read. */
 };
