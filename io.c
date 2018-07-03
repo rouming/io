@@ -166,6 +166,7 @@ static struct iovec_iter buf_it(struct io_buf *buf, size_t off)
 static int buf_it_realloc(struct io_buf *buf, struct iovec_iter *it, size_t sz)
 {
 	struct iovec *iov;
+	void *tmp;
 
 	/*
 	 * Here we come because of two reasons:
@@ -181,9 +182,11 @@ static int buf_it_realloc(struct io_buf *buf, struct iovec_iter *it, size_t sz)
 		sz += iov->iov_len;
 	else
 		sz  = iov->iov_len;
-	iov->iov_base = realloc(iov->iov_base, sz);
-	if (iov->iov_base == NULL)
+
+	tmp = realloc(iov->iov_base, sz);
+	if (tmp == NULL)
 		return -ENOMEM;
+	iov->iov_base = tmp;
 	buf->iov_free[it->iov_ind] = true;
 	iov->iov_len = sz;
 
@@ -352,6 +355,7 @@ static int stash_rest(struct io_req *req, size_t off, size_t end)
 	struct io_queue *q = req->q;
 	struct iovec *st = &q->stash;
 	size_t len, sz;
+	void *tmp;
 
 	if (off == INT_MAX) {
 		/* Special case, stash everything */
@@ -363,13 +367,10 @@ static int stash_rest(struct io_req *req, size_t off, size_t end)
 	assert(q->stash_pos == 0);
 	if (st->iov_base == NULL || malloc_usable_size(st->iov_base) < len) {
 		sz = round_up(len, _4K);
-		st->iov_base = realloc(st->iov_base, sz);
-		if (st->iov_base == NULL) {
-			q->stash.iov_len = 0;
-			q->stash_pos = 0;
-
+		tmp = realloc(st->iov_base, sz);
+		if (tmp == NULL)
 			return -ENOMEM;
-		}
+		st->iov_base = tmp;
 	}
 	sz = buf_memcpy_to(&req->buf, off, st->iov_base, len);
 	assert(sz == len);
