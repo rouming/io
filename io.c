@@ -671,7 +671,7 @@ static bool can_complete_rd(struct io_buf *buf, size_t sz)
 		 * we must absorb what was told by the proto to have a package
 		 * of exact size.
 		 */
-		return sz == hint;
+		return buf_pos(buf) == hint;
 	else
 		/*
 		 * Even proto hinted us we have to follow restriction of the
