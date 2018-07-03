@@ -81,7 +81,7 @@ static void *buf_it_iovbase(struct io_buf *buf, struct iovec_iter *it)
 	return buf_it_iov(buf, it)->iov_base + it->iov_off;
 }
 
-static bool buf_vari_len(struct io_buf *buf)
+bool buf_vari_len(struct io_buf *buf)
 {
 	return buf->is_vari_len;
 }

@@ -61,6 +61,7 @@ struct io_buf {
 void buf_free(struct io_buf *buf);
 int buf_pos(struct io_buf *buf);
 int buf_len(struct io_buf *buf);
+bool buf_vari_len(struct io_buf *buf);
 int buf_memcpy_to(struct io_buf *buf, size_t off, void *dst, size_t len);
 
 struct io_req {
