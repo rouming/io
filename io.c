@@ -27,6 +27,9 @@
 
 #include "io.h"
 
+/* Testing options */
+#define SIMULATE_1_BYTE_RDWR 0
+
 #define _4K          4096
 #define POLLER_RESET (void *)~0ull
 
@@ -424,6 +427,9 @@ static int __read(int fd, struct io_req *req, size_t len)
 	struct io_buf *buf = &req->buf;
 	struct iovec_iter end = END_IT(buf);
 
+	if (SIMULATE_1_BYTE_RDWR)
+		len = 1;
+
 	iovlen = buf_it_iovlen(buf, &buf->pos, &end);
 	len = len ? min(len, iovlen) : iovlen;
 	dst = buf_it_iovbase(buf, &buf->pos);
@@ -479,13 +485,17 @@ static int __write(int fd, struct io_req *req)
 
 	if (iov->iov_base == NULL)
 		return -EINVAL;
-	if (!buf->pos.iov_off) {
+	if (!buf->pos.iov_off && !SIMULATE_1_BYTE_RDWR) {
 		return SAFE_CALL(writev(fd, iov, iovcnt));
 	} else {
 		iov_stack[0] = (struct iovec){
 			.iov_base = buf_it_iovbase(buf, &buf->pos),
 			.iov_len  = buf_it_iovlen(buf, &buf->pos, &end)
 		};
+		if (SIMULATE_1_BYTE_RDWR) {
+			iov_stack[0].iov_len = 1;
+			iovcnt = 1;
+		}
 		if (iovcnt > 1)
 			memcpy(iov_stack + 1, iov + 1,
 			       sizeof(iov_stack[0]) * (iovcnt - 1));
